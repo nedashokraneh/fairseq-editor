@@ -15,9 +15,9 @@ import sys
 
 import numpy as np
 import torch
-
+from torch.utils.tensorboard import SummaryWriter
 from fairseq import checkpoint_utils, distributed_utils, options, tasks, utils
-from fairseq.data import iterators
+from fairseq.data import iterators, encoders
 from fairseq.logging import meters, metrics, progress_bar
 from fairseq.trainer import Trainer
 
@@ -79,7 +79,6 @@ def main(args, init_distributed=False):
     # Load the latest checkpoint if one is available and restore the
     # corresponding train iterator
     extra_state, epoch_itr = checkpoint_utils.load_checkpoint(args, trainer)
-
     # Train until the learning rate gets too small
     max_epoch = args.max_epoch or math.inf
     max_update = args.max_update or math.inf
@@ -194,6 +193,7 @@ def train(args, trainer, task, epoch_itr):
             and num_updates > 0
         ):
             valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
+            valid_losses = SARI_validate(args, trainer, task, epoch_itr)
             checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
 
         if num_updates >= max_update:
@@ -264,6 +264,148 @@ def validate(args, trainer, task, epoch_itr, subsets):
         valid_losses.append(stats[args.best_checkpoint_metric])
     return valid_losses
 
+def SARI_validate(
+    args,
+    trainer,
+    task,
+    epoch_itr,
+):
+
+    import ast
+    from fairseq_cli.interactive import buffered_read, make_batches
+    #proc_src_filepath = cfg.dataset.proc_raw_src_valid
+    src_filepath = args.raw_src_valid
+    pred_dir = os.path.join(args.save_dir, "temp_results")
+    if not os.path.exists(pred_dir):
+        os.makedirs(pred_dir)
+    pred_filepath = os.path.join(pred_dir, "iter_" + str(trainer.get_num_updates()) + ".out")
+
+    parser = options.get_generation_parser(interactive=True)
+    gen_args = options.parse_args_and_arch(parser, input_args=['/home/nshokran/dummy_data', '--beam', '1'])
+    # Initialize generator
+    generator = task.build_generator(gen_args)
+    max_positions = utils.resolve_max_positions(
+        task.max_positions(),
+        trainer.get_model().max_positions(),
+    )
+    tokenizer = encoders.build_tokenizer(args.tokenizer)
+    bpe = encoders.build_bpe(args.bpe)
+
+    def encode_fn(x):
+        if tokenizer is not None:
+            x = tokenizer.encode(x)
+        if bpe is not None:
+            x = bpe.encode(x)
+        return x
+
+    def decode_fn(x):
+        if bpe is not None:
+            x = bpe.decode(x)
+        if tokenizer is not None:
+            x = tokenizer.decode(x)
+        return x
+
+    start_id = 0
+    print("starting translation")
+    with open(pred_filepath, 'w') as f:
+        for inputs in buffered_read(src_filepath, buffer_size=500):
+            results = []
+            for batch in make_batches(inputs, args, task, max_positions, encode_fn):
+
+                src_tokens = batch.src_tokens
+                src_lengths = batch.src_lengths
+                decoder_input = batch.decoder_input
+                if torch.cuda.is_available() and not args.cpu:
+                    src_tokens = src_tokens.cuda()
+                    src_lengths = src_lengths.cuda()
+                    if decoder_input is not None:
+                        decoder_input = decoder_input.cuda()
+
+
+                sample = {
+                    'net_input': {
+                        'src_tokens': src_tokens,
+                        'src_lengths': src_lengths,
+                    },
+                    'decoder_input' : decoder_input,
+                }
+
+                translations = task.inference_step(generator, [trainer.model], sample)
+                for i, (id, hypos) in enumerate(zip(batch.ids.tolist(), translations)):
+                    src_tokens_i = utils.strip_pad(src_tokens[i], task.target_dictionary.pad())
+                    results.append((start_id + id, src_tokens_i, hypos))
+
+
+            for id_, src_tokens, hypos in sorted(results, key=lambda x: x[0]):
+                if task.source_dictionary is not None:
+                    src_str = task.source_dictionary.string(src_tokens, args.remove_bpe)
+
+
+                # Process top predictions
+                # Process top predictions
+
+                for hypo in hypos[:min(len(hypos), gen_args.nbest)]:
+                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                        hypo_tokens=hypo['tokens'].int().cpu(),
+                        src_str=src_str,
+                        alignment=hypo['alignment'].int().cpu() if hypo['alignment'] is not None else None,
+                        align_dict=None,
+                        tgt_dict=task.target_dictionary,
+                        remove_bpe=args.remove_bpe,
+                    )
+                    detok_hypo_str = decode_fn(hypo_str)
+                    f.write(f'{detok_hypo_str}\n')
+
+
+            # update running id counter
+            start_id += len(results)
+    print("starting post processing")
+    sys.path.insert(1, '/home/nshokran/utils')
+    from utils import merge_word_pieces, read_lines
+    '''
+    if cfg.dataset.proc_type == 'bpe':
+        merge_word_pieces(pred_filepath,1)
+    if cfg.dataset.proc_type == 'pg':
+        cmd = "python /home/nshokran/baselines/seq2seq/fairseq/examples/pointer_generator/postprocess.py --source " + cfg.dataset.raw_src_valid + " --target " + pred_filepath + " --target-out " + pred_filepath + ".proc"
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+        cmd = "cp " + pred_filepath + ".proc " + pred_filepath
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+        cmd = "rm " + pred_filepath + ".proc"
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+    '''
+    print("start reading files")
+    pred_sents = read_lines(pred_filepath)
+    src_sents = read_lines(args.raw_src_valid)
+    ref_sents = []
+    if os.path.isfile(args.raw_ref_valid):
+        ref_sents.append(read_lines(args.raw_ref_valid))
+    elif os.path.isdir(args.raw_ref_valid):
+        for ref_path in os.listdir(args.raw_ref_valid):
+            ref_sents.append(read_lines(os.path.join(args.raw_ref_valid,ref_path)))
+    from easse.sari import corpus_sari
+    print("starting calculating score")
+    SARI_score = corpus_sari(src_sents, pred_sents, ref_sents)
+    '''
+
+    cmd = "easse evaluate -t turkcorpus_valid -m 'bleu,sari,fkgl' --sys_sents_path " + proc_pred_filepath
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    p.wait()
+    out,err = p.communicate()
+    out = out.decode("utf-8")[:-1]
+    out = ast.literal_eval(out)
+    SARI_score = out['sari']
+    ref_dir = "/home/nshokran/data/wikilarge/turkcorpus/tune_8turkers"
+    #SARI_score = SARIfiles(ori_complex_filepath, proc_pred_filepath, ref_dir)
+    '''
+    print("SARI score = ",SARI_score)
+    writer = SummaryWriter(os.path.join(args.tensorboard_logdir, 'SARI'))
+    writer.add_scalar('SARI', SARI_score, epoch_itr.epoch)
+    #writer.add_scalar('SARI', SARI_score, trainer.get_num_updates())
+    return[SARI_score]
+
 
 def get_valid_stats(args, trainer, stats):
     if 'nll_loss' in stats and 'ppl' not in stats:
@@ -307,6 +449,7 @@ def cli_main(modify_parser=None):
             distributed_main(args.device_id, args)
     elif args.distributed_world_size > 1:
         # fallback for single node with multiple GPUs
+        print(args.distributed_world_size)
         assert args.distributed_world_size <= torch.cuda.device_count()
         port = random.randint(10000, 20000)
         args.distributed_init_method = 'tcp://localhost:{port}'.format(port=port)

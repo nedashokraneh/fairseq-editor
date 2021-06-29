@@ -42,6 +42,8 @@ class IterativeRefinementGenerator(object):
         constrained_decoding=False,
         hard_constrained_decoding=False,
         random_seed=1,
+        init_src=False,
+        oracle_repos=False,
     ):
         """
         Generates translations based on iterative refinement.
@@ -75,6 +77,8 @@ class IterativeRefinementGenerator(object):
         self.random_seed = random_seed
         self.adaptive = adaptive
         self.models = models
+        self.init_src = init_src
+        self.oracle_repos = oracle_repos
 
     def generate_batched_itr(
         self,
@@ -156,7 +160,14 @@ class IterativeRefinementGenerator(object):
 
         # initialize
         encoder_out = model.forward_encoder([src_tokens, src_lengths])
-        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens, constraints, constraint_marks)
+        if self.init_src:
+            init_tokens = sample['decoder_input']
+        else:
+            init_tokens = None
+        prev_decoder_out = model.initialize_output_tokens(
+            encoder_out, src_tokens, init_tokens=init_tokens
+        )
+        #prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens, constraints, constraint_marks)
 
         if self.beam_size > 1:
             assert model.allow_length_beam, \
@@ -211,7 +222,10 @@ class IterativeRefinementGenerator(object):
                 "hypo_attn": hypo_attn,
                 "alignment": alignment,
             }
-
+        if not "target" in sample:
+            tgt_tokens = None
+        else:
+            tgt_tokens = sample["target"]
         for step in range(self.max_iter + 1):
 
             decoder_options = {
@@ -219,7 +233,11 @@ class IterativeRefinementGenerator(object):
                 "del_reward": self.del_reward,
                 "max_ratio": self.max_ratio,
                 "decoding_format": self.decoding_format,
+                "tgt_tokens": tgt_tokens,
+                "src_tokens": sample["net_input"]["src_tokens"],
+                "oracle_repos": self.oracle_repos,
             }
+
             prev_decoder_out = prev_decoder_out._replace(
                 step=step,
                 max_step=self.max_iter + 1,
@@ -303,6 +321,8 @@ class IterativeRefinementGenerator(object):
                 if decoder_out.history is not None
                 else None,
             )
+            if tgt_tokens is not None:
+                tgt_tokens = tgt_tokens[not_terminated]
             encoder_out = model.encoder.reorder_encoder_out(encoder_out, not_terminated.nonzero().squeeze())
             sent_idxs = sent_idxs[not_terminated]
             prev_output_tokens = prev_decoder_out.output_tokens.clone()

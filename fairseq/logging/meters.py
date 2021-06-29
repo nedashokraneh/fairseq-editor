@@ -10,8 +10,20 @@ from typing import Dict, Optional
 
 try:
     import torch
+
+    def type_as(a, b):
+        if torch.is_tensor(a) and torch.is_tensor(b):
+            return a.to(b)
+        else:
+            return a
+
+
 except ImportError:
     torch = None
+
+    def type_as(a, b):
+        return a
+
 
 try:
     import numpy as np
@@ -67,8 +79,8 @@ class AverageMeter(Meter):
         if val is not None:
             self.val = val
             if n > 0:
-                self.sum += val * n
-                self.count += n
+                self.sum = type_as(self.sum, val) + (val * n)
+                self.count = type_as(self.count, n) + n
 
     def state_dict(self):
         return {

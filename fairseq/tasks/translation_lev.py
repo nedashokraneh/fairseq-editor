@@ -25,11 +25,24 @@ class TranslationLevenshteinTask(TranslationTask):
         """Add task-specific arguments to the parser."""
         # fmt: off
         TranslationTask.add_args(parser)
+
         parser.add_argument(
             '--noise',
             default='random_delete',
             choices=['random_delete', 'random_delete_shuffle', 'random_mask', 'no_noise', 'full_mask'])
+
         parser.add_argument('--random-seed', default=1, type=int)
+
+        parser.add_argument(
+            "--init-src", action="store_true",
+            help="initialize with src during inference",
+        )
+
+        parser.add_argument(
+            "--oracle-repos", action="store_true",
+            help="use oracle reposition during inference",
+        )
+
 
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
         """Load a given dataset split.
@@ -43,7 +56,6 @@ class TranslationLevenshteinTask(TranslationTask):
 
         # infer langcode
         src, tgt = self.args.source_lang, self.args.target_lang
-
         self.datasets[split] = load_langpair_dataset(
             data_path, split, src, self.src_dict, tgt, self.tgt_dict,
             combine=combine, dataset_impl=self.args.dataset_impl,
@@ -155,7 +167,9 @@ class TranslationLevenshteinTask(TranslationTask):
             retain_history=getattr(args, 'retain_iter_history', False),
             constrained_decoding=getattr(args, 'constrained_decoding', False),
             hard_constrained_decoding=getattr(args, 'hard_constrained_decoding', False),
-            random_seed=getattr(args, 'random_seed', 1))
+            random_seed=getattr(args, 'random_seed', 1),
+            init_src=getattr(args, 'init_src', True),
+            oracle_repos=getattr(args, 'oracle_repos', False))
 
     def build_dataset_for_inference(self, src_tokens, src_lengths, tgt_tokens=None, tgt_lengths=None, num_source_inputs=1):
         if num_source_inputs == 1:

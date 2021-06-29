@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger('fairseq_cli.interactive')
 
 
-Batch = namedtuple('Batch', 'ids src_tokens src_lengths tgt_tokens')
+Batch = namedtuple('Batch', 'ids src_tokens src_lengths tgt_tokens decoder_input')
 Translation = namedtuple('Translation', 'src_str hypos pos_scores alignments')
 
 
@@ -48,7 +48,9 @@ def buffered_read(input, buffer_size):
 
 
 def make_batches(lines, args, task, max_positions, encode_fn, separator=' <sep> '):
-    if args.constrained_decoding:
+
+    #if args.constrained_decoding:
+    if 0:
         num_source_inputs = 3
         src_tokens = [
             task.source_dictionary.encode_line(
@@ -110,6 +112,7 @@ def make_batches(lines, args, task, max_positions, encode_fn, separator=' <sep> 
             src_tokens=batch['net_input']['src_tokens'],
             src_lengths=batch['net_input']['src_lengths'],
             tgt_tokens=batch['target'],
+            decoder_input=batch['decoder_input']
         )
 
 
@@ -206,6 +209,7 @@ def main(args):
             src_lengths = batch.src_lengths
             tgt_tokens = batch.tgt_tokens
             num_sentences += src_tokens[0].size(0)
+            decoder_input = batch.decoder_input
             if use_cuda:
                 if isinstance(src_tokens, list):
                     src_tokens = [tokens.cuda() for tokens in src_tokens]
@@ -213,6 +217,8 @@ def main(args):
                 else:
                     src_tokens = src_tokens.cuda()
                     src_lengths = src_lengths.cuda()
+                    if decoder_input is not None:
+                        decoder_input = decoder_input.cuda()
 
             sample = {
                 'net_input': {
@@ -220,6 +226,7 @@ def main(args):
                     'src_lengths': src_lengths,
                 },
                 'target': tgt_tokens,
+                'decoder_input' : decoder_input,
             }
 
             gen_timer.start()

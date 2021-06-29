@@ -1,0 +1,8 @@
+# ninja log v5
+1	436	1622071228099678086	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/clib/libbleu/module.o	11c4cb60774d327a
+1	607	1622071228271679121	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/clib/libbleu/libbleu.o	3569c02faf5a6a0d
+0	4554	1622071233003707613	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/data/data_utils_fast.o	56d99158a8dd2e06
+0	5171	1622071238327739671	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/data/token_block_utils_fast.o	8a8c12f8c1db8eab
+1	16344	1622071254839839102	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/clib/libnat/edit_dist.o	5264867c2f379bd0
+2	17989	1622071273267950084	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/clib/libnat_cuda/binding.o	64eb0b905f3a07c1
+1	55770	1622071311072177798	/home/nshokran/baselines/seq2seq/fairseq-editor/build/temp.linux-x86_64-3.6/fairseq/clib/libnat_cuda/edit_dist.o	37d235faed2db24c

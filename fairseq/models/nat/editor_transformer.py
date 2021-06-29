@@ -30,6 +30,45 @@ from .levenshtein_utils import (
     _apply_ins_masks, _apply_ins_words, _apply_reposition_words,
 )
 
+import pandas as pd
+import numpy as np
+
+def same_size(t1, t2, pad_idx):
+    if t1.size(1) > t2.size(1):
+        pads = t2.new_full((t2.size(0), t1.size(1) - t2.size(1)),pad_idx)
+        t2 = torch.cat([t2,pads],1)
+    if t1.size(1) < t2.size(1):
+        pads = t1.new_full((t1.size(0), t2.size(1) - t1.size(1)),pad_idx)
+        t1 = torch.cat([t1,pads],1)
+    return(t1,t2)
+
+
+def summary(masks, predictions, ground_truths):
+    summary_df = []
+    for mask, prediction, ground_truth in zip(masks, predictions, ground_truths):
+        false_del = 0
+        true_del = 0
+        true_repos = 0
+        false_repos = 0
+        for i,(m,p,t) in enumerate(zip(mask, prediction, ground_truth)):
+            if m == 1 and i > 0:
+                if t == 0:
+                    if p == 0:
+                        true_del = true_del + 1
+                    else:
+                        false_del = false_del + 1
+                else:
+                    if t != i:
+                        if p == t:
+                            true_repos = true_repos + 1
+                        else:
+                            false_repos = false_repos + 1
+
+        summary_df.append({"true_del": true_del, "false_del": false_del,
+                           "true_repos": true_repos, "false_repos": false_repos})
+    summary_df = pd.DataFrame(summary_df)
+    return(summary_df.sum())
+
 
 @register_model("editor_transformer")
 class EDITORTransformerModel(FairseqNATModel):
@@ -68,24 +107,171 @@ class EDITORTransformerModel(FairseqNATModel):
             help='instead of argmax, use sampling to predict the tokens'
         )
 
+        parser.add_argument(
+            "--dae-ratio",
+            type=float,
+            help='ratio of noisy target as y_ins'
+        )
+
+        parser.add_argument(
+            "--alpha-ratio",
+            type=float,
+            help='ratio of inserted string as y_del'
+        )
+
+        parser.add_argument(
+            "--dual-path",
+            action="store_true",
+            help="use both ins,rep and rep,ins during training",
+        )
+
+
+
     @classmethod
     def build_decoder(cls, args, tgt_dict, embed_tokens):
         decoder = EDITORTransformerDecoder(args, tgt_dict, embed_tokens)
         if getattr(args, "apply_bert_init", False):
             decoder.apply(init_bert_params)
+        decoder.dae_ratio = getattr(args, "dae_ratio", 0.5)
+        decoder.alpha_ratio = getattr(args, "alpha_ratio", 0.5)
+        decoder.dual_path = getattr(args, "dual_path", False)
         return decoder
 
     def forward(
-        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, **kwargs
+        self, src_tokens, src_lengths, lp_src_tokens, prev_output_tokens, tgt_tokens, **kwargs
     ):
 
         assert tgt_tokens is not None, "forward function only supports training."
 
         # encoding
+        objs = {}
+
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
 
-        if random.random() < 0.5:  # insertion -> reposition & deletion
+        '''
+        if self.decoder.init_tokens == "source_token":
+            prev_output_tokens = lp_src_tokens
+        elif self.decoder.init_tokens == "noisy_target":
+            prev_output_tokens = prev_output_tokens
+        elif self.decoder.init_tokens == "mix":
+            if prev_output_tokens.size(1) > lp_src_tokens.size(1):
+                pads = lp_src_tokens.new_full((lp_src_tokens.size(0),prev_output_tokens.size(1) - lp_src_tokens.size(1)),self.pad)
+                lp_src_tokens = torch.cat([lp_src_tokens,pads],1)
+            if prev_output_tokens.size(1) < lp_src_tokens.size(1):
+                pads = prev_output_tokens.new_full((prev_output_tokens.size(0), lp_src_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
+                prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
+            corrupted = (
+                            torch.rand(size=(lp_src_tokens.size(0),), device=lp_src_tokens.device)
+                            < 0.5
+                        )
+            prev_output_tokens[corrupted] = lp_src_tokens[corrupted]
+        else:
+            if random.random() < 0.5:
+                prev_output_tokens = lp_src_tokens
+
+        if prev_output_tokens.size(1) > tgt_tokens.size(1):
+            pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
+            tgt_tokens = torch.cat([tgt_tokens,pads],1)
+        if prev_output_tokens.size(1) < tgt_tokens.size(1):
+            pads = prev_output_tokens.new_full((prev_output_tokens.size(0), tgt_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
+            prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
+        '''
+
+        ####### string ready to learn insertion from #######
+        word_reposition = _get_advanced_reposition_targets(lp_src_tokens, tgt_tokens, self.pad)
+        y_ins, _, _, _ = _apply_reposition_words(
+            lp_src_tokens,
+            None,
+            None,
+            None,
+            word_reposition,
+            self.pad,
+            self.bos,
+            self.eos,
+        )
+        if self.decoder.dae_ratio > 0:
+            corrupted = (
+                            torch.rand(size=(lp_src_tokens.size(0),), device=lp_src_tokens.device)
+                            < self.decoder.dae_ratio
+                        )
+            y_ins, prev_output_tokens = same_size(y_ins, prev_output_tokens, self.pad)
+            y_ins[corrupted] = prev_output_tokens[corrupted]
+        #####################################################
+
+        y_ins, tgt_tokens = same_size(y_ins, tgt_tokens, self.pad)
+
+        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
+            y_ins, tgt_tokens, self.pad, self.unk
+        )
+        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
+        mask_ins_masks = y_ins[:, 1:].ne(self.pad)
+
+        mask_ins_out, _ = self.decoder.forward_mask_ins(
+            normalize=False,
+            prev_output_tokens=y_ins,
+            encoder_out=encoder_out
+        )
+        word_ins_out, _ = self.decoder.forward_word_ins(
+            normalize=False,
+            prev_output_tokens=masked_tgt_tokens,
+            encoder_out=encoder_out
+        )
+
+        objs['mask_ins'] = {
+            "out": mask_ins_out, "tgt": mask_ins_targets,
+            "mask": mask_ins_masks, "ls": 0.01,
+        }
+        objs['word_ins'] = {
+            "out": word_ins_out, "tgt": tgt_tokens,
+            "mask": masked_tgt_masks, "ls": self.args.label_smoothing,
+            "nll_loss": True, "factor": 1.0,
+        }
+
+        if self.decoder.sampling_for_deletion:
+            word_predictions = torch.multinomial(
+                F.softmax(word_ins_out, -1).view(-1, word_ins_out.size(-1)), 1).view(
+                    word_ins_out.size(0), -1)
+        else:
+            word_predictions = F.log_softmax(word_ins_out, dim=-1).max(-1)[1]
+
+        word_predictions.masked_scatter_(
+            ~masked_tgt_masks, tgt_tokens[~masked_tgt_masks]
+        )
+
+        ####### string ready to learn reposition from #######
+        y_del = lp_src_tokens
+        if self.decoder.alpha_ratio > 0:
+            y_del, word_predictions = same_size(y_del, word_predictions, self.pad)
+            corrupted = (
+                            torch.rand(size=(lp_src_tokens.size(0),), device=lp_src_tokens.device)
+                            < self.decoder.alpha_ratio
+                        )
+            y_del[corrupted] = word_predictions[corrupted]
+        ######################################################
+
+        y_del, tgt_tokens = same_size(y_del, tgt_tokens, self.pad)
+
+        word_reposition_targets = _get_advanced_reposition_targets(
+            y_del, tgt_tokens, self.pad
+        )
+        word_reposition_out, _ = self.decoder.forward_word_reposition(
+            normalize=False,
+            prev_output_tokens=y_del,
+            encoder_out=encoder_out)
+        word_reposition_masks = y_del.ne(self.pad)
+
+        objs['word_reposition'] = {
+            "out": word_reposition_out, "tgt": word_reposition_targets,
+            "mask": word_reposition_masks,
+        }
+
+
+        #print(prev_output_tokens)
+        #if self.decoder.dual_path and random.random() < 0.5:  # insertion -> reposition & deletion
             # generate training labels for insertion
+        '''
+        if self.decoder.dual_path:
+
             masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
                 prev_output_tokens, tgt_tokens, self.pad, self.unk
             )
@@ -102,6 +288,16 @@ class EDITORTransformerModel(FairseqNATModel):
                 prev_output_tokens=masked_tgt_tokens,
                 encoder_out=encoder_out
             )
+
+            objs['mask_ins1'] = {
+                "out": mask_ins_out, "tgt": mask_ins_targets,
+                "mask": mask_ins_masks, "ls": 0.01,
+            }
+            objs['word_ins1'] = {
+                "out": word_ins_out, "tgt": tgt_tokens,
+                "mask": masked_tgt_masks, "ls": self.args.label_smoothing,
+                "nll_loss": True, "factor": 1.0,
+            }
 
             # make online prediction
             if self.decoder.sampling_for_deletion:
@@ -122,76 +318,86 @@ class EDITORTransformerModel(FairseqNATModel):
                 prev_output_tokens=word_predictions,
                 encoder_out=encoder_out)
             word_reposition_masks = word_predictions.ne(self.pad)
-        else:  # reposition & deletion -> insertion
-            # generate training labels for deletion and substitution
-            word_reposition_targets = _get_advanced_reposition_targets(
-                prev_output_tokens, tgt_tokens, self.pad
-            )
-            word_reposition_out, _ = self.decoder.forward_word_reposition(
-                normalize=False,
-                prev_output_tokens=prev_output_tokens,
-                encoder_out=encoder_out)
-            word_reposition_masks = prev_output_tokens.ne(self.pad)
 
-            # make online prediction
-            word_predictions = F.log_softmax(word_reposition_out, dim=-1).max(-1)[1]
-
-            word_predictions, _, _, _ = _apply_reposition_words(
-                prev_output_tokens,
-                None,
-                None,
-                None,
-                word_predictions,
-                self.pad,
-                self.bos,
-                self.eos,
-            )
-
-            # generate training labels for insertion
-            masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
-                word_predictions, tgt_tokens, self.pad, self.unk
-            )
-            mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
-            mask_ins_masks = word_predictions[:, 1:].ne(self.pad)
-
-            mask_ins_out, _ = self.decoder.forward_mask_ins(
-                normalize=False,
-                prev_output_tokens=word_predictions,
-                encoder_out=encoder_out
-            )
-            word_ins_out, _ = self.decoder.forward_word_ins(
-                normalize=False,
-                prev_output_tokens=masked_tgt_tokens,
-                encoder_out=encoder_out
-            )
-
-        return {
-            "mask_ins": {
-                "out": mask_ins_out, "tgt": mask_ins_targets,
-                "mask": mask_ins_masks, "ls": 0.01,
-            },
-            "word_ins_ml": {
-                "out": word_ins_out, "tgt": tgt_tokens,
-                "mask": masked_tgt_masks, "ls": self.args.label_smoothing,
-                "nll_loss": True, "factor": 1.0,
-            },
-            "word_reposition": {
+            objs['word_reposition1'] = {
                 "out": word_reposition_out, "tgt": word_reposition_targets,
                 "mask": word_reposition_masks,
             }
+
+        #else:  # reposition & deletion -> insertion
+            # generate training labels for deletion and substitution
+
+        word_reposition_targets = _get_advanced_reposition_targets(
+            prev_output_tokens, tgt_tokens, self.pad
+        )
+        word_reposition_out, _ = self.decoder.forward_word_reposition(
+            normalize=False,
+            prev_output_tokens=prev_output_tokens,
+            encoder_out=encoder_out)
+        word_reposition_masks = prev_output_tokens.ne(self.pad)
+
+        objs['word_reposition2'] = {
+            "out": word_reposition_out, "tgt": word_reposition_targets,
+            "mask": word_reposition_masks,
         }
 
-    def forward_decoder(
-        self, decoder_out, encoder_out, hard_constrained_decoding=False, eos_penalty=0.0, del_reward=0.0, max_ratio=None, **kwargs
-    ):
+        # make online prediction
+        word_predictions = F.log_softmax(word_reposition_out, dim=-1).max(-1)[1]
 
+        word_predictions, _, _, _ = _apply_reposition_words(
+            prev_output_tokens,
+            None,
+            None,
+            None,
+            word_predictions,
+            self.pad,
+            self.bos,
+            self.eos,
+        )
+
+        # generate training labels for insertion
+        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_advanced_ins_targets(
+            word_predictions, tgt_tokens, self.pad, self.unk
+        )
+        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
+        mask_ins_masks = word_predictions[:, 1:].ne(self.pad)
+
+        mask_ins_out, _ = self.decoder.forward_mask_ins(
+            normalize=False,
+            prev_output_tokens=word_predictions,
+            encoder_out=encoder_out
+        )
+
+        word_ins_out, _ = self.decoder.forward_word_ins(
+            normalize=False,
+            prev_output_tokens=masked_tgt_tokens,
+            encoder_out=encoder_out
+        )
+
+        objs['mask_ins2'] = {
+            "out": mask_ins_out, "tgt": mask_ins_targets,
+            "mask": mask_ins_masks, "ls": 0.01,
+        }
+        objs['word_ins2'] = {
+            "out": word_ins_out, "tgt": tgt_tokens,
+            "mask": masked_tgt_masks, "ls": self.args.label_smoothing,
+            "nll_loss": True, "factor": 1.0,
+        }
+        '''
+
+        return objs
+
+    def forward_decoder(
+        self, decoder_out, encoder_out, src_tokens, tgt_tokens,
+        hard_constrained_decoding=False, eos_penalty=0.0, del_reward=0.0, max_ratio=None,
+        oracle_repos=False, **kwargs
+    ):
         output_tokens = decoder_out.output_tokens
         output_marks = decoder_out.output_marks
         output_scores = decoder_out.output_scores
         attn = decoder_out.attn
         total_reposition_ops, total_deletion_ops, total_insertion_ops = decoder_out.num_ops
         history = decoder_out.history
-
         bsz = output_tokens.size(0)
         if max_ratio is None:
             max_lens = torch.zeros_like(output_tokens).fill_(255)
@@ -207,6 +413,7 @@ class EDITORTransformerModel(FairseqNATModel):
         # do not apply if it is <s> </s>
         can_reposition_word = output_tokens.ne(self.pad).sum(1) > 2
         if can_reposition_word.sum() != 0:
+
             word_reposition_score, word_reposition_attn = self.decoder.forward_word_reposition(
                 normalize=True,
                 prev_output_tokens=_skip(output_tokens, can_reposition_word),
@@ -221,27 +428,84 @@ class EDITORTransformerModel(FairseqNATModel):
 
             word_reposition_score[:, :, 0] = word_reposition_score[:, :, 0] + del_reward
             word_reposition_pred = word_reposition_score.max(-1)[1]
-            num_deletion = word_reposition_pred.eq(0).sum().item() - word_reposition_pred.size(0)
+            #print("output token: ", output_tokens)
+            #print("pred: ", word_reposition_pred)
+            '''
+            num_deletion = torch.mul(output_tokens.ne(self.pad), word_reposition_pred.eq(0)).sum().item() - word_reposition_pred.size(0)
+            print("num deletes: ", num_deletion)
             total_deletion_ops += num_deletion
-            total_reposition_ops += word_reposition_pred.ne(
+            print("total op: ", torch.mul(output_tokens.ne(self.pad), word_reposition_pred.ne(
                 torch.arange(word_reposition_pred.size(1), device=word_reposition_pred.device)
-                .unsqueeze(0)).sum().item() - num_deletion
-
-            _tokens, _marks, _scores, _attn = _apply_reposition_words(
-                output_tokens[can_reposition_word],
-                output_marks[can_reposition_word],
-                output_scores[can_reposition_word],
-                word_reposition_attn,
-                word_reposition_pred,
-                self.pad,
-                self.bos,
-                self.eos,
+                .unsqueeze(0))).sum().item())
+            num_reposition_ops = torch.mul(output_tokens.ne(self.pad), word_reposition_pred.ne(
+                torch.arange(word_reposition_pred.size(1), device=word_reposition_pred.device)
+                .unsqueeze(0))).sum().item() - num_deletion
+            print("num repositions: ", num_reposition_ops)
+            total_reposition_ops += num_reposition_ops
+            
+            oracle_word_reposition_pred = _get_advanced_reposition_targets(
+                output_tokens, tgt_tokens, self.pad
             )
+            #print("oracle pred: ", oracle_word_reposition_pred)
+
+
+            #print(summary(output_tokens.ne(self.pad), word_reposition_pred, oracle_word_reposition_pred))
+            summary_df = summary(output_tokens.ne(self.pad), word_reposition_pred, oracle_word_reposition_pred)
+            oracle_num_deletion = torch.mul(oracle_word_reposition_pred.eq(0),output_tokens.ne(self.pad)).sum().item() - oracle_word_reposition_pred.size(0)
+            #print("oracle num deletes: ", oracle_num_deletion)
+            oracle_num_reposition_ops = torch.mul(output_tokens.ne(self.pad), oracle_word_reposition_pred.ne(
+                torch.arange(oracle_word_reposition_pred.size(1), device=oracle_word_reposition_pred.device)
+                .unsqueeze(0))).sum().item() - oracle_num_deletion
+            #print("oracle num repositions: ", oracle_num_reposition_ops)
+
+            del_precision = summary_df['true_del'] / total_deletion_ops
+            del_recall = summary_df['true_del'] / oracle_num_deletion
+            repos_precision = summary_df['true_repos'] / total_reposition_ops
+            repos_recall = summary_df['true_repos'] / oracle_num_reposition_ops
+            print("oracle del: ", oracle_num_deletion, ", oracle repos: ", oracle_num_reposition_ops)
+            print("del precision: ", del_precision, ", del recall: ", del_recall, ", repos precision: ", repos_precision, ", repos recall: ", repos_recall)
+            '''
+
+            if oracle_repos:
+                oracle_word_reposition_pred = _get_advanced_reposition_targets(
+                    output_tokens, tgt_tokens, self.pad
+                )
+                _tokens, _marks, _scores, _attn = _apply_reposition_words(
+                    output_tokens[can_reposition_word],
+                    output_marks[can_reposition_word],
+                    output_scores[can_reposition_word],
+                    None,
+                    oracle_word_reposition_pred,
+                    self.pad,
+                    self.bos,
+                    self.eos,
+                )
+            else:
+                _tokens, _marks, _scores, _attn = _apply_reposition_words(
+                    output_tokens[can_reposition_word],
+                    output_marks[can_reposition_word],
+                    output_scores[can_reposition_word],
+                    word_reposition_attn,
+                    word_reposition_pred,
+                    self.pad,
+                    self.bos,
+                    self.eos,
+                )
+
+            '''
+            torch.set_printoptions(profile="full")
+            print("output tokens: ", output_tokens)
+            print("tgt tokens: ", tgt_tokens)
+            print("word reposition pred: ", word_reposition_pred)
+            print("word reposition target: ", word_reposition_targets)
+            '''
+
+
             output_tokens = _fill(output_tokens, can_reposition_word, _tokens, self.pad)
             output_marks = _fill(output_marks, can_reposition_word, _marks, 0)
             output_scores = _fill(output_scores, can_reposition_word, _scores, 0)
             attn = _fill(attn, can_reposition_word, _attn, 0.)
-
+            #print("output tokens after reposition: ", output_tokens)
             if history is not None:
                 history.append(output_tokens.clone())
 
@@ -259,7 +523,8 @@ class EDITORTransformerModel(FairseqNATModel):
             mask_ins_pred = torch.min(
                 mask_ins_pred, max_lens[can_ins_mask, None].expand_as(mask_ins_pred)
             )
-
+            #print("mask pred at step ", decoder_out.step, ": ", torch.sum(mask_ins_pred,1))
+            #print("total mask pred at step ", decoder_out.step, ": ", torch.sum(mask_ins_pred))
             if hard_constrained_decoding:
                 no_ins_mask = output_marks[can_ins_mask][:, :-1].eq(1)
                 mask_ins_pred.masked_fill_(no_ins_mask, 0)
@@ -323,6 +588,33 @@ class EDITORTransformerModel(FairseqNATModel):
             history=history
         )
 
+    def initialize_output_tokens(self, encoder_out, src_tokens, init_tokens=None):
+        if init_tokens is not None:
+            initial_output_tokens = init_tokens
+        else:
+            initial_output_tokens = src_tokens.new_zeros(src_tokens.size(0), 2)
+            initial_output_tokens[:, 0] = self.bos
+            initial_output_tokens[:, 1] = self.eos
+
+        initial_output_marks = initial_output_tokens.new_zeros(
+            *initial_output_tokens.size()
+        ).type_as(encoder_out.encoder_out)
+
+        initial_output_scores = initial_output_tokens.new_zeros(
+            *initial_output_tokens.size()
+        ).type_as(encoder_out.encoder_out)
+
+        return DecoderOut(
+            output_tokens=initial_output_tokens,
+            output_marks=initial_output_marks,
+            output_scores=initial_output_scores,
+            attn=None,
+            step=0,
+            max_step=0,
+            num_ops=(0, 0, 0),
+            history=None
+        )
+    '''
     def initialize_output_tokens(self, encoder_out, src_tokens, initial_tokens, initial_marks):
         initial_tokens = initial_tokens.tolist() if initial_tokens is not None else None
         initial_marks = initial_marks.tolist() if initial_marks is not None else None
@@ -359,7 +651,7 @@ class EDITORTransformerModel(FairseqNATModel):
             num_ops=(0, 0, 0),
             history=None
         )
-
+    '''
 
 class EDITORTransformerDecoder(FairseqNATDecoder):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):

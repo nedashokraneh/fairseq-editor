@@ -437,7 +437,6 @@ class TransformerEncoder(FairseqEncoder):
             *encoder_out* rearranged according to *new_order*
         """
         new_encoder_out: Dict[str, Tensor] = {}
-
         new_encoder_out["encoder_out"] = (
             encoder_out.encoder_out
             if encoder_out.encoder_out is None
@@ -474,6 +473,7 @@ class TransformerEncoder(FairseqEncoder):
             src_tokens=src_tokens,  # B x T
             src_lengths=src_lengths,  # B x 1
         )
+
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""

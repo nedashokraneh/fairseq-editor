@@ -26,6 +26,8 @@ def get_training_parser(default_task="translation"):
     add_model_args(parser)
     add_optimization_args(parser)
     add_checkpoint_args(parser)
+    add_interactive_args(parser)
+    add_common_eval_args(parser)
     return parser
 
 
@@ -329,6 +331,8 @@ def add_dataset_args(parser, train=False, gen=False):
                                 ' (defaults to --max-sentences)')
         group.add_argument('--curriculum', default=0, type=int, metavar='N',
                            help='don\'t shuffle batches for first N epochs')
+
+
     if gen:
         group.add_argument('--gen-subset', default='test', metavar='SPLIT',
                            help='data subset to generate (train, valid, test)')
@@ -336,6 +340,7 @@ def add_dataset_args(parser, train=False, gen=False):
                            help='shard generation over N shards')
         group.add_argument('--shard-id', default=0, type=int, metavar='ID',
                            help='id of the shard to generate (id < num_shards)')
+
     # fmt: on
     return group
 
@@ -381,6 +386,7 @@ def add_distributed_training_args(parser):
     group.add_argument('--broadcast-buffers', default=False, action='store_true',
                        help='Copy non-trainable parameters between GPUs, such as '
                       'batchnorm population statistics')
+
     # fmt: on
     return group
 
@@ -456,6 +462,10 @@ def add_checkpoint_args(parser):
                        help=('early stop training if valid performance doesn\'t '
                              'improve for N consecutive validation runs; note '
                              'that this is influenced by --validate-interval'))
+    group.add_argument('--raw-src-valid', type=str,
+                       help='path of src validation dataset for calculation of SARI score')
+    group.add_argument('--raw-ref-valid', type=str,
+                       help='path of reference(s) for a validation dataset for calculation of SARI score')
     # fmt: on
     return group
 
